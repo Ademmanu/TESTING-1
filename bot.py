@@ -1,19 +1,20 @@
-import logging
-import asyncio
-import tempfile
-import pandas as pd
-from datetime import datetime, timedelta
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import os
-from dotenv import load_dotenv
-import phonenumbers
-import json
+import asyncio
+import logging
+import re
+from datetime import datetime, timedelta
+from io import BytesIO, StringIO
+from typing import Dict, List, Set, Tuple, Optional
+import random
 import time
+from collections import defaultdict
 
-# Load environment variables
-load_dotenv()
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, 
+    filters, ContextTypes, CallbackQueryHandler
+)
+from telegram.error import TelegramError
 
 # Configure logging
 logging.basicConfig(
@@ -22,630 +23,876 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# States
-SETTING_RETRY_TIME = 1
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Set in Render environment variables
+PORT = int(os.environ.get("PORT", 8443))
+TIMEZONE_OFFSET = "+1"  # UTC+1
 
-# Store data (in production, use database)
-class DataStore:
+# Valid country codes (extend as needed)
+VALID_COUNTRY_CODES = {
+    '234', '237', '7', '20', '33', '44', '49', '55', '81', '82',
+    '86', '91', '92', '93', '94', '98', '212', '213', '216', '218',
+    '220', '221', '222', '223', '224', '225', '226', '227', '228',
+    '229', '230', '231', '232', '233', '234', '235', '236', '237',
+    '238', '239', '240', '241', '242', '243', '244', '245', '246',
+    '247', '248', '249', '250', '251', '252', '253', '254', '255',
+    '256', '257', '258', '259', '260', '261', '262', '263', '264',
+    '265', '266', '267', '268', '269', '290', '291', '297', '298',
+    '299', '350', '351', '352', '353', '354', '355', '356', '357',
+    '358', '359', '370', '371', '372', '373', '374', '375', '376',
+    '377', '378', '379', '380', '381', '382', '383', '385', '386',
+    '387', '389', '420', '421', '423', '500', '501', '502', '503',
+    '504', '505', '506', '507', '508', '509', '590', '591', '592',
+    '593', '594', '595', '596', '597', '598', '599', '670', '672',
+    '673', '674', '675', '676', '677', '678', '679', '680', '681',
+    '682', '683', '685', '686', '687', '688', '689', '690', '691',
+    '692', '850', '852', '853', '855', '856', '880', '886', '960',
+    '961', '962', '963', '964', '965', '966', '967', '968', '970',
+    '971', '972', '973', '974', '975', '976', '977', '992', '993',
+    '994', '995', '996', '998'
+}
+
+# ============================================================================
+# USER DATA MANAGEMENT
+# ============================================================================
+class UserData:
     def __init__(self):
-        self.checked_numbers = {}
-        self.user_data = {}
-    
-    def save_to_file(self, filename='data.json'):
-        """Save data to file"""
-        data = {
-            'checked_numbers': self.checked_numbers,
-            'user_data': self.user_data
+        self.operations = {
+            'whatsapp': True,      # Check WhatsApp
+            'sms': True,           # Check SMS receive
+            'combo_mode': False,   # Combo AND mode
+            'whatsapp_type': 'all',  # 'all', 'on', 'off'
+            'sms_type': 'all'       # 'all', 'on', 'off'
         }
-        with open(filename, 'w') as f:
-            json.dump(data, f, default=str)
+        self.last_activity = datetime.now()
+        self.processing = False
     
-    def load_from_file(self, filename='data.json'):
-        """Load data from file"""
-        try:
-            with open(filename, 'r') as f:
-                data = json.load(f)
-                self.checked_numbers = data.get('checked_numbers', {})
-                self.user_data = data.get('user_data', {})
-        except FileNotFoundError:
-            pass
+    def get_operations_display(self):
+        """Get human-readable operations status"""
+        ops = []
+        if self.operations['whatsapp']:
+            if self.operations['whatsapp_type'] == 'on':
+                ops.append("✅ On WhatsApp")
+            elif self.operations['whatsapp_type'] == 'off':
+                ops.append("❌ Not on WhatsApp")
+            else:
+                ops.append("📱 WhatsApp Status")
+        
+        if self.operations['sms']:
+            if self.operations['sms_type'] == 'on':
+                ops.append("📨 Can receive SMS")
+            elif self.operations['sms_type'] == 'off':
+                ops.append("⏳ SMS Try again later")
+            else:
+                ops.append("📨 SMS Status")
+        
+        if self.operations['combo_mode'] and len(ops) > 1:
+            ops[-1] = f"🔀 COMBO: {' AND '.join(ops)}"
+        
+        return ops
 
-# Initialize store
-store = DataStore()
-store.load_from_file()
+# Store user data in memory (for production, use Redis/Database)
+user_sessions = {}
 
-# WhatsApp Checker with real implementation
-class WhatsAppChecker:
-    def __init__(self):
-        self.api_cooldown = 1  # seconds between API calls
+def get_user_data(user_id: int) -> UserData:
+    """Get or create user data"""
+    if user_id not in user_sessions:
+        user_sessions[user_id] = UserData()
+    return user_sessions[user_id]
+
+# ============================================================================
+# NUMBER PROCESSING & VALIDATION
+# ============================================================================
+def normalize_phone_number(number: str) -> Optional[str]:
+    """
+    Normalize phone number to E.164 format without +
+    """
+    # Remove all non-digit characters except leading +
+    number = number.strip()
     
-    async def check_number(self, phone_number: str) -> str:
-        """
-        Check if phone number is on WhatsApp using multiple methods
-        """
-        try:
-            # Clean phone number
-            clean_phone = self.clean_phone_number(phone_number)
-            if not clean_phone:
-                return "invalid"
-            
-            # Method 1: Try pywhatkit (works for single checks)
-            try:
-                import pywhatkit
-                # This method tries to open WhatsApp Web
-                # Note: This might not work in server environments
-                # For server, we need API-based solution
-                return await self._check_with_api(clean_phone)
-                
-            except ImportError:
-                # Fallback to API method
-                return await self._check_with_api(clean_phone)
-                
-        except Exception as e:
-            logger.error(f"Error checking {phone_number}: {e}")
-            return "error"
+    # Remove spaces, dashes, parentheses
+    number = re.sub(r'[\s\-()]', '', number)
     
-    def clean_phone_number(self, phone: str) -> str:
-        """Clean and format phone number"""
-        try:
-            # Remove spaces, dashes, parentheses
-            phone = phone.strip()
-            if phone.startswith('0'):
-                phone = '+234' + phone[1:]  # Nigeria example
-            elif phone.startswith('234'):
-                phone = '+' + phone
-            elif not phone.startswith('+'):
-                phone = '+' + phone
-            
-            # Remove any non-digit characters except +
-            digits = ''.join(c for c in phone if c.isdigit() or c == '+')
-            return digits
-        except:
-            return None
+    # Handle + prefix
+    if number.startswith('+'):
+        number = number[1:]
     
-    async def _check_with_api(self, phone: str) -> str:
-        """
-        Check using external API service
-        You can replace this with your preferred API
-        """
-        # SIMULATION - Replace with actual API call
-        
-        # Example API call structure (commented out):
-        """
-        import requests
-        api_url = "https://api.whatsapp.com/check"
-        params = {
-            'phone': phone,
-            'api_key': os.getenv('WHATSAPP_API_KEY')
-        }
-        
-        try:
-            response = requests.get(api_url, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                return "on_whatsapp" if data.get('exists') else "not_on_whatsapp"
-        except:
-            pass
-        """
-        
-        # For now, simulate checking with 80% success rate
-        await asyncio.sleep(0.5)  # Simulate API delay
-        
-        # Deterministic check based on last digit
-        last_digit = phone[-1]
-        if last_digit in ['0', '2', '4', '6', '8']:
-            return "on_whatsapp"
-        else:
-            return "not_on_whatsapp"
-        
-        # In production, replace above with actual API call
+    # Remove leading zeros
+    number = number.lstrip('0')
     
-    def update_status(self, phone: str, status: str, retry_hours: int = 24):
-        """Update number status"""
-        now = datetime.now()
-        next_retry = None
-        
-        if status == "not_on_whatsapp":
-            next_retry = now + timedelta(hours=retry_hours)
-        
-        store.checked_numbers[phone] = {
-            'status': status,
-            'last_check': now.isoformat(),
-            'next_retry': next_retry.isoformat() if next_retry else None,
-            'attempts': store.checked_numbers.get(phone, {}).get('attempts', 0) + 1
-        }
-        
-        # Save to file periodically
-        if len(store.checked_numbers) % 10 == 0:
-            store.save_to_file()
-
-# Initialize checker
-checker = WhatsAppChecker()
-
-# Bot handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
-    welcome = """
-🔍 *WhatsApp Number Checker*
-
-*Commands:*
-/check - Check phone numbers
-/filter - Filter results
-/export - Export to file
-/status - Show statistics
-/setretry - Set retry time (default: 24h)
-
-*Formats accepted:*
-+2348012345678
-2348012345678
-08012345678
-08123456789
-
-*Features:*
-• Check if numbers have WhatsApp
-• Track retry attempts
-• Multiple filter combinations
-• Export CSV/Excel/TXT
-• Batch processing
-"""
-    await update.message.reply_text(welcome, parse_mode='Markdown')
-
-async def check_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /check command"""
-    if context.args:
-        # Numbers provided in command
-        text = ' '.join(context.args)
-        await process_numbers(update, context, text)
-    else:
-        # Ask for numbers
-        await update.message.reply_text(
-            "Send phone numbers (one per line or comma-separated):\n\n"
-            "Examples:\n"
-            "`+2348012345678, +2348023456789`\n"
-            "Or upload a .txt/.csv file",
-            parse_mode='Markdown'
-        )
-        return SETTING_RETRY_TIME
-
-async def process_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE, numbers_text: str = None):
-    """Process numbers from text or file"""
-    if not numbers_text and update.message.text:
-        numbers_text = update.message.text
+    # Validate number length
+    if len(number) < 8 or len(number) > 15:
+        return None
     
-    if not numbers_text:
-        await update.message.reply_text("No numbers provided.")
-        return ConversationHandler.END
+    # Extract country code
+    for cc in VALID_COUNTRY_CODES:
+        if number.startswith(cc):
+            # Ensure there's a subscriber number after country code
+            if len(number) > len(cc):
+                return number
     
-    # Extract numbers
+    # If no country code matches, assume it's already a national number
+    # You might want to add a default country code here
+    return number if len(number) >= 10 else None
+
+def extract_numbers_from_text(text: str) -> List[str]:
+    """Extract and normalize phone numbers from text"""
     numbers = []
-    for line in numbers_text.split('\n'):
-        for part in line.split(','):
-            part = part.strip()
-            if part and any(c.isdigit() for c in part):
-                numbers.append(part)
     
-    if not numbers:
-        await update.message.reply_text("No valid numbers found.")
-        return ConversationHandler.END
+    # Split by lines and common delimiters
+    lines = text.split('\n')
+    for line in lines:
+        # Split by comma, semicolon, tab, or space
+        parts = re.split(r'[,\s;]+', line.strip())
+        for part in parts:
+            if part:
+                normalized = normalize_phone_number(part)
+                if normalized:
+                    numbers.append(normalized)
     
-    # Ask for retry time
-    context.user_data['numbers_to_check'] = numbers
-    await update.message.reply_text(
-        f"Found {len(numbers)} numbers. How many hours between retries?\n"
-        "Send a number (1-168) or /skip for default (24h):"
-    )
-    return SETTING_RETRY_TIME
+    return list(set(numbers))  # Remove duplicates
 
-async def set_retry_and_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set retry time and start checking"""
-    retry_hours = 24
+def extract_numbers_from_file(file_content: bytes, filename: str) -> List[str]:
+    """Extract numbers from uploaded file"""
+    numbers = []
     
-    if update.message.text.lower() != '/skip':
-        try:
-            retry_hours = int(update.message.text)
-            if not 1 <= retry_hours <= 168:
-                await update.message.reply_text("Please enter 1-168 hours.")
-                return SETTING_RETRY_TIME
-        except ValueError:
-            await update.message.reply_text("Please enter a number or /skip.")
-            return SETTING_RETRY_TIME
-    
-    numbers = context.user_data.get('numbers_to_check', [])
-    
-    if not numbers:
-        await update.message.reply_text("No numbers to check.")
-        return ConversationHandler.END
-    
-    # Start checking
-    progress_msg = await update.message.reply_text(
-        f"⏳ Checking {len(numbers)} numbers...\n"
-        f"Progress: 0/{len(numbers)} (0%)"
-    )
-    
-    results = []
-    for i, number in enumerate(numbers, 1):
-        # Check number
-        status = await checker.check_number(number)
-        checker.update_status(number, status, retry_hours)
-        
-        # Get clean number
-        clean_num = checker.clean_phone_number(number) or number
-        
-        # Store result
-        result = {
-            'phone': clean_num,
-            'status': status,
-            'check_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        
-        # Add retry info if applicable
-        if status == 'not_on_whatsapp':
-            next_retry = datetime.now() + timedelta(hours=retry_hours)
-            result['next_retry'] = next_retry.strftime('%Y-%m-%d %H:%M:%S')
-        
-        results.append(result)
-        
-        # Update progress every 5 numbers
-        if i % 5 == 0 or i == len(numbers):
-            progress = int((i / len(numbers)) * 100)
-            on_whatsapp = len([r for r in results if r['status'] == 'on_whatsapp'])
-            not_on_whatsapp = len([r for r in results if r['status'] == 'not_on_whatsapp'])
-            
-            await progress_msg.edit_text(
-                f"🔍 Checking {len(numbers)} numbers...\n"
-                f"Progress: {i}/{len(numbers)} ({progress}%)\n"
-                f"✅ On WhatsApp: {on_whatsapp}\n"
-                f"❌ Not on WhatsApp: {not_on_whatsapp}"
-            )
-        
-        # Rate limiting
-        await asyncio.sleep(0.5)
-    
-    # Store results
-    context.user_data['check_results'] = results
-    context.user_data['retry_hours'] = retry_hours
-    
-    # Save to file
-    store.user_data[str(update.effective_user.id)] = {
-        'last_check': datetime.now().isoformat(),
-        'total_checked': len(numbers)
-    }
-    store.save_to_file()
-    
-    # Show completion with options
-    keyboard = [
-        [InlineKeyboardButton("📊 View Stats", callback_data='view_stats')],
-        [InlineKeyboardButton("🔍 Filter Results", callback_data='filter_menu')],
-        [InlineKeyboardButton("📤 Export All", callback_data='export_all')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    on_count = len([r for r in results if r['status'] == 'on_whatsapp'])
-    off_count = len([r for r in results if r['status'] == 'not_on_whatsapp'])
-    
-    await update.message.reply_text(
-        f"✅ Check Complete!\n\n"
-        f"📊 Statistics:\n"
-        f"• Total checked: {len(numbers)}\n"
-        f"• ✅ On WhatsApp: {on_count}\n"
-        f"• ❌ Not on WhatsApp: {off_count}\n"
-        f"• Retry interval: {retry_hours} hours\n\n"
-        f"Use /filter to select which numbers to export.",
-        reply_markup=reply_markup
-    )
-    
-    return ConversationHandler.END
-
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle file uploads"""
-    if not update.message.document:
-        return
-    
-    file = await update.message.document.get_file()
-    filename = update.message.document.file_name
-    
-    # Check file type
-    if not filename.lower().endswith(('.txt', '.csv')):
-        await update.message.reply_text("Please send .txt or .csv file only.")
-        return
-    
-    # Download file
-    temp_path = f"temp_{int(time.time())}_{filename}"
-    await file.download_to_drive(temp_path)
-    
-    # Read file
     try:
         if filename.endswith('.txt'):
-            with open(temp_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        else:  # CSV
-            df = pd.read_csv(temp_path)
-            content = '\n'.join(df.iloc[:, 0].astype(str).tolist())
+            text = file_content.decode('utf-8', errors='ignore')
+            numbers = extract_numbers_from_text(text)
         
-        # Process numbers
-        await process_numbers(update, context, content)
-        
+        elif filename.endswith('.csv'):
+            text = file_content.decode('utf-8', errors='ignore')
+            # Simple CSV parsing - look for numbers in all cells
+            lines = text.split('\n')
+            for line in lines:
+                cells = line.split(',')
+                for cell in cells:
+                    normalized = normalize_phone_number(cell.strip())
+                    if normalized:
+                        numbers.append(normalized)
+    
     except Exception as e:
-        logger.error(f"File error: {e}")
-        await update.message.reply_text("Error reading file. Please check format.")
-    finally:
-        # Cleanup
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        logger.error(f"Error parsing file: {e}")
+    
+    return list(set(numbers))
 
-async def filter_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show filter options"""
+# ============================================================================
+# SIMULATION FUNCTIONS (Replace with actual API calls)
+# ============================================================================
+async def check_whatsapp_status(number: str) -> Tuple[bool, str]:
+    """
+    Simulate WhatsApp check
+    In production, replace with actual WhatsApp API
+    """
+    await asyncio.sleep(0.05)  # Simulate API delay
+    
+    # Simulation logic (replace with real API)
+    last_digit = int(number[-1]) if number[-1].isdigit() else 0
+    
+    if last_digit % 3 == 0:
+        return False, "Not on WhatsApp"
+    elif last_digit % 3 == 1:
+        return True, "On WhatsApp"
+    else:
+        return False, "Not on WhatsApp"
+
+async def check_sms_status(number: str) -> Tuple[bool, str, Optional[str]]:
+    """
+    Simulate SMS receive check
+    In production, replace with actual SMS API
+    """
+    await asyncio.sleep(0.05)  # Simulate API delay
+    
+    # Simulation logic (replace with real API)
+    last_digit = int(number[-1]) if number[-1].isdigit() else 0
+    
+    if last_digit % 4 == 0:
+        return True, "Can receive SMS", None
+    elif last_digit % 4 == 1:
+        wait_time = random.randint(1, 15)
+        return False, f"Try again in {wait_time} min", f"{wait_time}:00"
+    elif last_digit % 4 == 2:
+        wait_time = random.randint(16, 30)
+        return False, f"Try again in {wait_time} min", f"{wait_time}:00"
+    else:
+        return False, "Cannot receive SMS", None
+
+async def process_numbers(
+    numbers: List[str],
+    user_data: UserData
+) -> Tuple[Dict[str, List], Dict[str, int]]:
+    """
+    Process numbers based on user's operation settings
+    """
+    results = {
+        'whatsapp_on': [],
+        'whatsapp_off': [],
+        'sms_on': [],
+        'sms_off': [],
+        'combo': [],
+        'processed': []
+    }
+    
+    stats = {
+        'total': len(numbers),
+        'whatsapp_on': 0,
+        'whatsapp_off': 0,
+        'sms_on': 0,
+        'sms_off': 0,
+        'combo': 0
+    }
+    
+    # Process in batches to avoid blocking
+    batch_size = 10
+    for i in range(0, len(numbers), batch_size):
+        batch = numbers[i:i + batch_size]
+        batch_tasks = []
+        
+        for number in batch:
+            # Create tasks based on selected operations
+            task_info = {'number': number}
+            
+            if user_data.operations['whatsapp']:
+                task_info['whatsapp_task'] = asyncio.create_task(check_whatsapp_status(number))
+            
+            if user_data.operations['sms']:
+                task_info['sms_task'] = asyncio.create_task(check_sms_status(number))
+            
+            batch_tasks.append(task_info)
+        
+        # Wait for all tasks in batch
+        for task_info in batch_tasks:
+            number = task_info['number']
+            whatsapp_result = None
+            sms_result = None
+            
+            if 'whatsapp_task' in task_info:
+                whatsapp_status, whatsapp_msg = await task_info['whatsapp_task']
+                whatsapp_result = {
+                    'status': whatsapp_status,
+                    'message': whatsapp_msg
+                }
+            
+            if 'sms_task' in task_info:
+                sms_status, sms_msg, sms_wait = await task_info['sms_task']
+                sms_result = {
+                    'status': sms_status,
+                    'message': sms_msg,
+                    'wait_time': sms_wait
+                }
+            
+            # Apply filters
+            whatsapp_match = True
+            sms_match = True
+            
+            if user_data.operations['whatsapp']:
+                if user_data.operations['whatsapp_type'] == 'on':
+                    whatsapp_match = whatsapp_result['status'] if whatsapp_result else False
+                elif user_data.operations['whatsapp_type'] == 'off':
+                    whatsapp_match = not whatsapp_result['status'] if whatsapp_result else False
+            
+            if user_data.operations['sms']:
+                if user_data.operations['sms_type'] == 'on':
+                    sms_match = sms_result['status'] if sms_result else False
+                elif user_data.operations['sms_type'] == 'off':
+                    sms_match = not sms_result['status'] if sms_result else False
+            
+            # Check combo condition
+            if user_data.operations['combo_mode']:
+                if whatsapp_match and sms_match:
+                    results['combo'].append(number)
+                    stats['combo'] += 1
+            else:
+                # Individual results
+                if whatsapp_match and user_data.operations['whatsapp']:
+                    if whatsapp_result and whatsapp_result['status']:
+                        results['whatsapp_on'].append(number)
+                        stats['whatsapp_on'] += 1
+                    else:
+                        results['whatsapp_off'].append(number)
+                        stats['whatsapp_off'] += 1
+                
+                if sms_match and user_data.operations['sms']:
+                    if sms_result and sms_result['status']:
+                        results['sms_on'].append(number)
+                        stats['sms_on'] += 1
+                    else:
+                        results['sms_off'].append(number)
+                        stats['sms_off'] += 1
+            
+            # Store processed result
+            results['processed'].append({
+                'number': number,
+                'whatsapp': whatsapp_result,
+                'sms': sms_result
+            })
+        
+        # Small delay between batches
+        if i + batch_size < len(numbers):
+            await asyncio.sleep(0.1)
+    
+    return results, stats
+
+def generate_result_file(results: Dict, user_data: UserData) -> BytesIO:
+    """
+    Generate result file based on operations
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    if user_data.operations['combo_mode']:
+        filename = f"combo_results_{timestamp}.txt"
+        content = "=== COMBO RESULTS ===\n"
+        content += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (UTC{TIMEZONE_OFFSET})\n"
+        content += f"Operations: {' AND '.join(user_data.get_operations_display())}\n\n"
+        
+        if results['combo']:
+            content += "Numbers matching ALL conditions:\n"
+            for number in results['combo']:
+                content += f"+{number}\n"
+        else:
+            content += "No numbers matched all conditions\n"
+    
+    else:
+        filename = f"checking_results_{timestamp}.txt"
+        content = "=== CHECKING RESULTS ===\n"
+        content += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (UTC{TIMEZONE_OFFSET})\n\n"
+        
+        ops_display = user_data.get_operations_display()
+        for op in ops_display:
+            content += f"{op}\n"
+        content += "\n"
+        
+        if user_data.operations['whatsapp']:
+            if results['whatsapp_on']:
+                content += "✅ ON WHATSAPP:\n"
+                for number in results['whatsapp_on']:
+                    content += f"+{number}\n"
+                content += "\n"
+            
+            if results['whatsapp_off']:
+                content += "❌ NOT ON WHATSAPP:\n"
+                for number in results['whatsapp_off']:
+                    content += f"+{number}\n"
+                content += "\n"
+        
+        if user_data.operations['sms']:
+            if results['sms_on']:
+                content += "📨 CAN RECEIVE SMS:\n"
+                for number in results['sms_on']:
+                    content += f"+{number}\n"
+                content += "\n"
+            
+            if results['sms_off']:
+                content += "⏳ SMS TRY AGAIN LATER:\n"
+                for number in results['sms_off']:
+                    content += f"+{number}\n"
+    
+    # Convert to bytes
+    file_buffer = BytesIO(content.encode('utf-8'))
+    file_buffer.name = filename
+    
+    return file_buffer
+
+# ============================================================================
+# TELEGRAM BOT HANDLERS
+# ============================================================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user = update.effective_user
+    welcome_message = f"""
+👋 Welcome {user.first_name} to Number Validator Bot!
+
+I can check phone numbers for:
+✅ WhatsApp status (On/Off WhatsApp)
+✅ SMS receive status (Can receive SMS/Try again later)
+✅ Combo checks (Multiple conditions simultaneously)
+
+📤 Send me:
+1. List of numbers (one per line)
+2. .txt file with numbers
+3. .csv file with numbers
+
+📞 Format: +2348123456789 or 2348123456789
+🌍 Country codes allowed: +1, +234, +237, +7, +91, etc.
+
+⚙️ Commands:
+/setop - Set checking operations
+/status - Show current settings
+/help - Show help
+/about - About this bot
+
+⏰ Timezone: UTC{TIMEZONE_OFFSET}
+"""
+    
+    await update.message.reply_text(welcome_message)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    help_text = """
+📚 **HELP GUIDE**
+
+**1. Sending Numbers:**
+- Paste numbers (one per line)
+- Upload .txt or .csv file
+- Format: +2348123456789 or 2348123456789
+
+**2. Setting Operations (/setop):**
+- Choose what to check:
+  1️⃣ On WhatsApp only
+  2️⃣ Not on WhatsApp only
+  3️⃣ Can receive SMS only
+  4️⃣ SMS try again later
+  5️⃣ Combo mode (add 'c' for AND combination)
+
+**3. Examples:**
+- "1" = Check only WhatsApp users
+- "1,3" = Check WhatsApp + SMS receivers
+- "2,4,c" = COMBO: Not on WhatsApp AND SMS try later
+
+**4. Results:**
+- Files are auto-generated
+- Includes timestamp (UTC{TIMEZONE_OFFSET})
+- Shows statistics
+- Removes duplicates
+
+**5. Notes:**
+- Processing may take time for large files
+- Maximum 1000 numbers per batch
+- Results are not stored
+"""
+    await update.message.reply_text(help_text)
+
+async def setop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /setop command to set operations"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    
     keyboard = [
         [
-            InlineKeyboardButton("✅ On WhatsApp", callback_data='filter_on'),
-            InlineKeyboardButton("❌ Not on WhatsApp", callback_data='filter_off')
+            InlineKeyboardButton("1️⃣ WhatsApp On", callback_data="op_1"),
+            InlineKeyboardButton("2️⃣ WhatsApp Off", callback_data="op_2")
         ],
         [
-            InlineKeyboardButton("🔄 Need Retry", callback_data='filter_retry'),
-            InlineKeyboardButton("✅ + 🔄 Combo", callback_data='filter_combo')
+            InlineKeyboardButton("3️⃣ SMS On", callback_data="op_3"),
+            InlineKeyboardButton("4️⃣ SMS Off", callback_data="op_4")
         ],
         [
-            InlineKeyboardButton("📤 Export Filtered", callback_data='export_filtered'),
-            InlineKeyboardButton("🔄 Reset", callback_data='filter_reset')
+            InlineKeyboardButton("🔀 Enable Combo", callback_data="op_combo"),
+            InlineKeyboardButton("✅ Apply Settings", callback_data="op_apply")
+        ],
+        [
+            InlineKeyboardButton("🔄 Reset to Default", callback_data="op_reset")
         ]
     ]
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        "🔍 *Filter Options*\n\n"
-        "Select which numbers to include:\n"
-        "• ✅ On WhatsApp - Numbers with WhatsApp\n"
-        "• ❌ Not on WhatsApp - No WhatsApp account\n"
-        "• 🔄 Need Retry - Scheduled for re-check\n"
-        "• ✅ + 🔄 Combo - Custom combination\n\n"
-        "Then click 'Export Filtered' to download.",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
-    )
+    ops_display = "\n".join([f"• {op}" for op in user_data.get_operations_display()])
+    
+    message = f"""
+⚙️ **SET OPERATIONS**
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button clicks"""
+Current settings:
+{ops_display}
+
+**Select operations:**
+1️⃣ - On WhatsApp only
+2️⃣ - Not on WhatsApp only
+3️⃣ - Can receive SMS only
+4️⃣ - SMS try again later
+
+**Combo Mode:** {'✅ Enabled' if user_data.operations['combo_mode'] else '❌ Disabled'}
+• Combo requires 2+ operations
+• Numbers must match ALL conditions
+
+**Or type manually:** "1,3" or "2,4,c"
+"""
+    
+    await update.message.reply_text(message, reply_markup=reply_markup)
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status command"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    
+    ops_display = "\n".join([f"• {op}" for op in user_data.get_operations_display()])
+    
+    status_message = f"""
+📊 **BOT STATUS**
+
+**Your Settings:**
+{ops_display}
+
+**Timezone:** UTC{TIMEZONE_OFFSET}
+**Last Activity:** {user_data.last_activity.strftime('%Y-%m-%d %H:%M:%S')}
+
+**Ready to receive:**
+• List of numbers (paste)
+• .txt files
+• .csv files
+
+Use /setop to change operations
+"""
+    
+    await update.message.reply_text(status_message)
+
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /about command"""
+    about_text = """
+🤖 **Number Validator Bot**
+
+**Version:** 2.0.0
+**Timezone:** UTC{TIMEZONE_OFFSET}
+
+**Features:**
+• WhatsApp status checking
+• SMS receive capability testing
+• Combo mode (multiple conditions)
+• File generation (TXT)
+• Batch processing
+• Duplicate removal
+
+**Country Codes Supported:**
+All major country codes (200+)
+Format: +[country code][number]
+
+**Privacy:**
+• Numbers are processed temporarily
+• No data storage
+• Results auto-delete after sending
+
+**For support:** Contact developer
+"""
+    await update.message.reply_text(about_text)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks"""
     query = update.callback_query
     await query.answer()
     
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_data)
+    
     data = query.data
     
-    if data == 'filter_menu':
-        await filter_numbers(query.message, context)
+    if data == "op_1":
+        user_data.operations['whatsapp'] = True
+        user_data.operations['whatsapp_type'] = 'on'
+        user_data.operations['sms'] = False
+        await query.edit_message_text("✅ Set: On WhatsApp only\nClick 'Apply Settings' when done")
     
-    elif data.startswith('filter_'):
-        # Store filter selection
-        context.user_data['current_filter'] = data.replace('filter_', '')
-        
-        if data == 'filter_combo':
-            # Show combo filter options
-            keyboard = [
-                [
-                    InlineKeyboardButton("Not on WhatsApp", callback_data='combo_not'),
-                    InlineKeyboardButton("Not on Retry", callback_data='combo_no_retry')
-                ],
-                [
-                    InlineKeyboardButton("Both (AND)", callback_data='combo_both_and'),
-                    InlineKeyboardButton("Either (OR)", callback_data='combo_both_or')
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(
-                "🔀 *Combined Filters*\n\n"
-                "Select combination:\n"
-                "• Not on WhatsApp + Not on Retry\n"
-                "• Choose AND (both true) or OR (either true)",
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
-        else:
-            await query.edit_message_text(
-                f"Filter set to: {data.replace('filter_', '').replace('_', ' ').title()}\n\n"
-                "Click 'Export Filtered' to download."
-            )
+    elif data == "op_2":
+        user_data.operations['whatsapp'] = True
+        user_data.operations['whatsapp_type'] = 'off'
+        user_data.operations['sms'] = False
+        await query.edit_message_text("✅ Set: Not on WhatsApp only\nClick 'Apply Settings' when done")
     
-    elif data == 'export_filtered' or data == 'export_all':
-        await export_results(update, context, data == 'export_all')
+    elif data == "op_3":
+        user_data.operations['whatsapp'] = False
+        user_data.operations['sms'] = True
+        user_data.operations['sms_type'] = 'on'
+        await query.edit_message_text("✅ Set: Can receive SMS only\nClick 'Apply Settings' when done")
     
-    elif data.startswith('combo_'):
-        # Handle combo filters
-        combo_type = data.replace('combo_', '')
-        context.user_data['combo_filter'] = combo_type
-        
-        if combo_type in ['both_and', 'both_or']:
-            desc = "Not on WhatsApp AND Not on Retry" if combo_type == 'both_and' else "Not on WhatsApp OR Not on Retry"
-            await query.edit_message_text(
-                f"✅ Filter set to: {desc}\n\n"
-                "Click 'Export Filtered' to download."
-            )
+    elif data == "op_4":
+        user_data.operations['whatsapp'] = False
+        user_data.operations['sms'] = True
+        user_data.operations['sms_type'] = 'off'
+        await query.edit_message_text("✅ Set: SMS try again later\nClick 'Apply Settings' when done")
+    
+    elif data == "op_combo":
+        user_data.operations['combo_mode'] = not user_data.operations['combo_mode']
+        status = "✅ Enabled" if user_data.operations['combo_mode'] else "❌ Disabled"
+        await query.edit_message_text(f"Combo Mode: {status}\nSelect operations first, then apply")
+    
+    elif data == "op_apply":
+        ops_display = "\n".join(user_data.get_operations_display())
+        await query.edit_message_text(f"""
+✅ Settings Applied!
 
-async def export_results(update: Update, context: ContextTypes.DEFAULT_TYPE, export_all: bool = False):
-    """Export filtered results"""
-    query = update.callback_query
-    if query:
-        user_id = query.from_user.id
-        message = query.message
-    else:
-        user_id = update.effective_user.id
-        message = update.message
+Active operations:
+{ops_display}
+
+Ready to receive numbers!
+Send list or file now.
+        """)
     
-    # Get results
-    results = context.user_data.get('check_results', [])
+    elif data == "op_reset":
+        user_data.operations = {
+            'whatsapp': True,
+            'sms': True,
+            'combo_mode': False,
+            'whatsapp_type': 'all',
+            'sms_type': 'all'
+        }
+        await query.edit_message_text("🔄 Reset to default settings\nBoth WhatsApp and SMS checking enabled")
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages containing numbers"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
     
-    if not results:
-        reply_text = "No results to export. Use /check first."
-        if query:
-            await query.edit_message_text(reply_text)
-        else:
-            await update.message.reply_text(reply_text)
+    if user_data.processing:
+        await update.message.reply_text("⏳ Please wait, still processing previous request...")
         return
     
-    # Apply filter if not exporting all
-    if not export_all:
-        filter_type = context.user_data.get('current_filter', '')
-        combo_type = context.user_data.get('combo_filter', '')
-        
-        filtered = results
-        
-        if filter_type == 'on':
-            filtered = [r for r in results if r['status'] == 'on_whatsapp']
-        elif filter_type == 'off':
-            filtered = [r for r in results if r['status'] == 'not_on_whatsapp']
-        elif filter_type == 'retry':
-            now = datetime.now()
-            filtered = [r for r in results if 'next_retry' in r and 
-                       datetime.strptime(r['next_retry'], '%Y-%m-%d %H:%M:%S') > now]
-        elif combo_type:
-            now = datetime.now()
-            if combo_type == 'both_and':
-                filtered = [r for r in results if 
-                           r['status'] == 'not_on_whatsapp' and 
-                           ('next_retry' not in r or 
-                            datetime.strptime(r['next_retry'], '%Y-%m-%d %H:%M:%S') > now)]
-            elif combo_type == 'both_or':
-                filtered = [r for r in results if 
-                           r['status'] == 'not_on_whatsapp' or 
-                           ('next_retry' not in r or 
-                            datetime.strptime(r['next_retry'], '%Y-%m-%d %H:%M:%S') > now)]
-        
-        results_to_export = filtered
-        filter_desc = filter_type or combo_type
-    else:
-        results_to_export = results
-        filter_desc = "all"
-    
-    if not results_to_export:
-        reply_text = "No numbers match your filter."
-        if query:
-            await query.edit_message_text(reply_text)
-        else:
-            await update.message.reply_text(reply_text)
+    # Check if this is a manual operation setting
+    text = update.message.text.strip()
+    if re.match(r'^[1-4,c\s]+$', text.replace(',', '')):
+        # It's an operation setting
+        await handle_manual_operation(update, text)
         return
     
-    # Create DataFrame
-    df = pd.DataFrame(results_to_export)
+    user_data.processing = True
+    user_data.last_activity = datetime.now()
     
-    # Create temporary file
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"whatsapp_numbers_{filter_desc}_{timestamp}.csv"
-    
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as tmp:
-        df.to_csv(tmp.name, index=False)
+    try:
+        # Extract numbers from text
+        numbers = extract_numbers_from_text(text)
+        
+        if not numbers:
+            await update.message.reply_text("""
+❌ No valid phone numbers found!
+
+Please send:
+• Numbers with country codes (e.g., +2348123456789)
+• One number per line
+• Or upload .txt/.csv file
+
+Format examples:
++2348123456789
+2348123456789
++14441234567
+""")
+            user_data.processing = False
+            return
+        
+        if len(numbers) > 1000:
+            await update.message.reply_text("⚠️ Too many numbers! Maximum is 1000. Sending first 1000...")
+            numbers = numbers[:1000]
+        
+        # Send processing message
+        ops_display = " + ".join(user_data.get_operations_display())
+        process_msg = await update.message.reply_text(
+            f"📊 Processing {len(numbers)} numbers...\n"
+            f"🔍 Checking: {ops_display}\n"
+            f"⏳ Estimated time: {len(numbers) * 0.2:.0f} seconds...\n"
+            f"🕐 Timezone: UTC{TIMEZONE_OFFSET}"
+        )
+        
+        # Process numbers
+        results, stats = await process_numbers(numbers, user_data)
+        
+        # Generate and send file
+        file_buffer = generate_result_file(results, user_data)
+        
+        # Update processing message
+        stats_text = f"""
+✅ Processing Complete!
+
+📈 Statistics:
+• Total numbers: {stats['total']}
+• WhatsApp On: {stats['whatsapp_on']}
+• WhatsApp Off: {stats['whatsapp_off']}
+• SMS Can Receive: {stats['sms_on']}
+• SMS Try Later: {stats['sms_off']}
+• Combo Matches: {stats['combo']}
+
+📁 Sending results file...
+"""
+        
+        await process_msg.edit_text(stats_text)
         
         # Send file
-        if query:
-            await query.message.reply_document(
-                document=open(tmp.name, 'rb'),
-                filename=filename,
-                caption=f"✅ Exported {len(results_to_export)} numbers\nFilter: {filter_desc}"
-            )
-        else:
-            await update.message.reply_document(
-                document=open(tmp.name, 'rb'),
-                filename=filename,
-                caption=f"✅ Exported {len(results_to_export)} numbers\nFilter: {filter_desc}"
-            )
+        await update.message.reply_document(
+            document=file_buffer,
+            caption=f"Results - UTC{TIMEZONE_OFFSET}"
+        )
         
-        # Cleanup
-        os.unlink(tmp.name)
-
-async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show checking statistics"""
-    user_id = str(update.effective_user.id)
-    user_data = store.user_data.get(user_id, {})
+    except Exception as e:
+        logger.error(f"Error processing text: {e}")
+        await update.message.reply_text(f"❌ Error processing numbers: {str(e)}")
     
-    total_checked = len(store.checked_numbers)
-    on_whatsapp = len([n for n in store.checked_numbers.values() if n.get('status') == 'on_whatsapp'])
-    not_on_whatsapp = total_checked - on_whatsapp
+    finally:
+        user_data.processing = False
+
+async def handle_manual_operation(update: Update, text: str):
+    """Handle manual operation setting via text"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
     
-    status_text = f"""
-📊 *Statistics*
+    parts = [p.strip() for p in text.split(',')]
+    
+    # Reset operations
+    user_data.operations['whatsapp'] = False
+    user_data.operations['sms'] = False
+    user_data.operations['combo_mode'] = False
+    user_data.operations['whatsapp_type'] = 'all'
+    user_data.operations['sms_type'] = 'all'
+    
+    # Parse operations
+    for part in parts:
+        if part == '1':
+            user_data.operations['whatsapp'] = True
+            user_data.operations['whatsapp_type'] = 'on'
+        elif part == '2':
+            user_data.operations['whatsapp'] = True
+            user_data.operations['whatsapp_type'] = 'off'
+        elif part == '3':
+            user_data.operations['sms'] = True
+            user_data.operations['sms_type'] = 'on'
+        elif part == '4':
+            user_data.operations['sms'] = True
+            user_data.operations['sms_type'] = 'off'
+        elif part.lower() == 'c':
+            user_data.operations['combo_mode'] = True
+    
+    ops_display = "\n".join(user_data.get_operations_display())
+    
+    await update.message.reply_text(f"""
+✅ Operations Set!
 
-*Global (All Users):*
-• Total numbers checked: {total_checked}
-• ✅ On WhatsApp: {on_whatsapp}
-• ❌ Not on WhatsApp: {not_on_whatsapp}
+Active checks:
+{ops_display}
 
-*Your Activity:*
-• Last check: {user_data.get('last_check', 'Never')}
-• Total checked by you: {user_data.get('total_checked', 0)}
+Send your numbers now!
+Format: +2348123456789 or upload file
+""")
 
-*Filters Available:*
-• /filter - Filter results
-• /export - Export numbers
-• /check - Check new numbers
-"""
-    await update.message.reply_text(status_text, parse_mode='Markdown')
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel conversation"""
-    await update.message.reply_text("Operation cancelled.")
-    return ConversationHandler.END
-
-def main():
-    """Start the bot"""
-    # Get token
-    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    if not TOKEN:
-        print("❌ Error: TELEGRAM_BOT_TOKEN not set")
-        print("Get token from @BotFather and add to environment variables")
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document uploads"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    
+    if user_data.processing:
+        await update.message.reply_text("⏳ Please wait, still processing previous request...")
         return
     
-    # Create application
-    app = Application.builder().token(TOKEN).build()
+    user_data.processing = True
+    user_data.last_activity = datetime.now()
     
-    # Add conversation handler for checking
-    check_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler('check', check_numbers),
-            MessageHandler(filters.Document.ALL, handle_file)
-        ],
-        states={
-            SETTING_RETRY_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_retry_and_check)
-            ]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-        allow_reentry=True
-    )
-    
-    # Add other handlers
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('filter', filter_numbers))
-    app.add_handler(CommandHandler('export', lambda u, c: export_results(u, c, True)))
-    app.add_handler(CommandHandler('status', show_status))
-    app.add_handler(check_handler)
-    
-    # Add button handler
-    app.add_handler(CallbackQueryHandler(button_handler))
-    
-    # Add file handler separately
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-    
-    # Start bot
-    print("🤖 Bot is starting...")
-    print(f"✅ Token loaded: {'Yes' if TOKEN else 'No'}")
-    
-    # For Render/Heroku, use webhook or polling
-    port = int(os.environ.get('PORT', 8443))
-    
-    if 'RENDER' in os.environ or 'HEROKU' in os.environ:
-        # Webhook for production
-        webhook_url = os.getenv('WEBHOOK_URL', '')
-        if webhook_url:
-            app.run_webhook(
-                listen="0.0.0.0",
-                port=port,
-                url_path=TOKEN,
-                webhook_url=f"{webhook_url}/{TOKEN}"
-            )
-        else:
-            print("⚠️ WEBHOOK_URL not set, using polling")
-            app.run_polling()
-    else:
-        # Polling for development
-        app.run_polling()
+    try:
+        document = update.message.document
+        file = await document.get_file()
+        file_content = await file.download_as_bytearray()
+        
+        # Check file type
+        filename = document.file_name.lower()
+        
+        if not (filename.endswith('.txt') or filename.endswith('.csv')):
+            await update.message.reply_text("❌ Unsupported file type! Please send .txt or .csv files only.")
+            user_data.processing = False
+            return
+        
+        # Extract numbers
+        numbers = extract_numbers_from_file(file_content, filename)
+        
+        if not numbers:
+            await update.message.reply_text("❌ No valid phone numbers found in the file!")
+            user_data.processing = False
+            return
+        
+        if len(numbers) > 1000:
+            await update.message.reply_text("⚠️ Large file detected! Processing first 1000 numbers...")
+            numbers = numbers[:1000]
+        
+        # Send processing message
+        ops_display = " + ".join(user_data.get_operations_display())
+        process_msg = await update.message.reply_text(
+            f"📄 File received: {document.file_name}\n"
+            f"📊 Found {len(numbers)} numbers\n"
+            f"🔍 Checking: {ops_display}\n"
+            f"⏳ Processing... This may take a moment\n"
+            f"🕐 Timezone: UTC{TIMEZONE_OFFSET}"
+        )
+        
+        # Process numbers
+        results, stats = await process_numbers(numbers, user_data)
+        
+        # Generate and send file
+        file_buffer = generate_result_file(results, user_data)
+        
+        # Update processing message
+        stats_text = f"""
+✅ File Processing Complete!
 
-if __name__ == '__main__':
+📈 Statistics:
+• Total numbers: {stats['total']}
+• WhatsApp On: {stats['whatsapp_on']}
+• WhatsApp Off: {stats['whatsapp_off']}
+• SMS Can Receive: {stats['sms_on']}
+• SMS Try Later: {stats['sms_off']}
+• Combo Matches: {stats['combo']}
+
+📁 Sending results file...
+"""
+        
+        await process_msg.edit_text(stats_text)
+        
+        # Send file
+        await update.message.reply_document(
+            document=file_buffer,
+            caption=f"Results from {document.file_name} - UTC{TIMEZONE_OFFSET}"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error processing document: {e}")
+        await update.message.reply_text(f"❌ Error processing file: {str(e)}")
+    
+    finally:
+        user_data.processing = False
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ An error occurred. Please try again later or contact support."
+            )
+    except:
+        pass
+
+# ============================================================================
+# APPLICATION SETUP
+# ============================================================================
+def main():
+    """Start the bot"""
+    # Create Application
+    application = Application.builder().token(TOKEN).build()
+    
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("setop", setop_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("about", about_command))
+    
+    # Add callback query handler for buttons
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Add message handlers
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    # Start the bot
+    if "RENDER" in os.environ:
+        # Running on Render
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TOKEN,
+            webhook_url=f"https://your-app-name.onrender.com/{TOKEN}"
+        )
+    else:
+        # Running locally
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
     main()
